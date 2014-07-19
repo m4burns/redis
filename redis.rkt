@@ -133,7 +133,10 @@
 (define (connection-pool-lease pool)
   (when (redis-connection-pool-dead? pool)
     (redis-error "Attempted to lease connection from dead connection pool."))
-  (or (hash-ref (redis-connection-pool-key=>conn pool) (current-thread) #f)
+  (or (let ([maybe-conn (hash-ref (redis-connection-pool-key=>conn pool) (current-thread) #f)])
+        (if (and maybe-conn (eq? (redis-connection-single-owner maybe-conn) (current-thread)))
+            maybe-conn
+            #f))
       (let ([conn
              (or (async-channel-try-get (redis-connection-pool-idle-conns pool))
                  (sync (redis-connection-pool-idle-conns pool)
