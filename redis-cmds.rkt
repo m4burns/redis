@@ -19,7 +19,7 @@
     [(_ CMD (~or (~optional (~seq #:return fn) #:defaults ([fn #'(lambda (x) x)]))
                  (~optional (~seq #:no-reply nr) #:defaults ([nr #f]))) ...)
     #:with a-send-cmd (if (attribute nr) #'send-cmd/no-reply #'send-cmd)
-    #'(define (CMD #:rconn [conn #f] 
+    #'(define (CMD #:rconn [conn (current-redis-connection)] 
                    #:host [host LOCALHOST]
                    #:port [port DEFAULT-REDIS-PORT] . args)
         (fn 
@@ -55,7 +55,7 @@
      #:with conn (datum->syntax #'CMDfn 'conn)
      #:with host (datum->syntax #'CMDfn 'host)
      #:with port (datum->syntax #'CMDfn 'port)
-     #'(define (CMDfn #:rconn [conn #f]
+     #'(define (CMDfn #:rconn [conn (current-redis-connection)]
                       #:host [host LOCALHOST]
                       #:port [port DEFAULT-REDIS-PORT] arg ...)
          body ...)]))
@@ -150,7 +150,7 @@
 
 ;; BITOP
 (define-syntax-rule (defcmd/bitop OP)
-  (define (OP #:rconn [conn #f]
+  (define (OP #:rconn [conn (current-redis-connection)]
               #:host [host LOCALHOST]
               #:port [port DEFAULT-REDIS-PORT] dest . keys)
     (apply send-cmd #:rconn conn #:host host #:port port 

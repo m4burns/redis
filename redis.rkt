@@ -15,353 +15,121 @@
          racket/tcp racket/match 
          racket/async-channel racket/contract racket/port
          "redis-error.rkt" "bytes-utils.rkt" "constants.rkt"
-         "nodelay.rkt")
+         "nodelay.rkt" (rename-in ffi/unsafe [-> ->/f]))
 (provide connect disconnect (struct-out redis-connection)
-         send-cmd send-cmd/no-reply current-redis-pool
-         get-reply get-reply/port get-reply-evt get-reply-evt/port
-         make-connection-pool kill-connection-pool redis-connection-pool?
-         connection-pool-lease connection-pool-return 
-         pubsub-connection? lease-pubsub-conn return-pubsub-conn make-subscribe-chan)
+         send-cmd send-cmd/no-reply get-reply get-reply/port
+         get-reply-evt get-reply-evt/port pubsub-connection?
+         pubsub-connect make-subscribe-chan current-redis-connection)
 
 ;; connect/disconnect ---------------------------------------------------------
 ;; owner = thread or #f; #f = pool thread owns it
-(struct redis-connection (in out [owner #:mutable] [pubsub #:auto #:mutable]))
+(struct redis-connection (in out owner [pubsub #:auto #:mutable] [closed? #:auto #:mutable]))
+
+(define current-redis-connection (make-parameter #f))
 
 (define/contract (connect [host LOCALHOST] [port DEFAULT-REDIS-PORT])
   (->* () (string? (integer-in 1 65535)) redis-connection?)
   (define-values (in out) (tcp-connect host port))
   (set-tcp-nodelay! out #t)
   (file-stream-buffer-mode out 'block)
-  (redis-connection in out (current-thread)))
+  (define conn (redis-connection in out (current-thread)))
+  (register-finalizer conn disconnect)
+  conn)
 
 (define/contract (disconnect conn)
   (-> redis-connection? void?)
-  (send-cmd #:rconn conn "QUIT")
-  (match-define (redis-connection in out _ _) conn)
-  (close-input-port in) (close-output-port out))
-
-;; connection pool ------------------------------------------------------------
-(struct redis-connection-pool
-  (host port [dead? #:mutable]
-   key=>conn  ; maps thread to its (leased) connection
-   pubsubs    ; leased pubsub connections
-   idle-conns ; queue (async-chan) of avail (ie returned) connections
-   fresh-conn-sema ; checks connection limit
-   manager-thread
-   custodian)) ; manages all tcp connections
-
-(define current-redis-pool (make-parameter #f))
-
-;; verifies that the owner of a connection is valid
-(define-syntax-rule (check-owner-ok connection operation-str)
-  (let ([curr-owner (redis-connection-owner connection)])
-    (unless (or (not curr-owner) ; owner = #f means the pool has it, so it's ok
-                (eq? curr-owner (current-thread)))
-      (redis-error 
-        (format "Attempted to ~a connection when not owner." operation-str)))))
-
-;; Construct a redis-connection-pool that will lease at most max-connections
-;; to client threads and will maintain at most max-idle unleased connections.
-;;
-;; A connection pool will lease a connection to a client thread when 
-;; connection-pool-lease is called on the pool. Further calls to 
-;; connection-pool-lease on the same connection pool and in the same thread, 
-;; with no intervening calls to connection-pool-return, will produce the 
-;; same connection. No other thread will be able to use the connection until 
-;; it is returned to the pool.
-;;
-;; Leased connections are explicitly returned to the pool of available
-;; connections when connection-pool-return is called on the connection pool 
-;; whence the connection was leased. Leased connections are also returned to 
-;; the pool when the leasing thread dies.
-;;
-;; Calling any command on a connection that is not leased to the current thread
-;; will raise an exception (except in the case of the pool's thread, which is 
-;; given elevated privilege). Attepting to lease a connection when there are no
-;; available connections in the pool will block until a connection is 
-;; available.
-;;
-;; A connection pool can be killed with kill-connection-pool. Killing a
-;; connection pool causes it to lease no further connections, close all idle
-;; connections, and immediately close any connection that is returned to the
-;; pool. Attempting to lease from a dead connection pool will result in an
-;; exception. Threads that were blocked on leasing a connection from a
-;; connection pool that was killed will block forever.
-(define/contract
-  (make-connection-pool #:host [host LOCALHOST]
-                        #:port [port DEFAULT-REDIS-PORT]
-                        #:max-connections [max-conn 100]
-                        #:max-idle [max-idle 10])
-  (->* () (#:host string?
-           #:port (integer-in 1 65535)
-           #:max-connections exact-nonnegative-integer?
-           #:max-idle exact-nonnegative-integer?)
-       redis-connection-pool?)
-  ;; create pool connections under a separate custodian
-  ;; (otherwise connections might be suddenly closed when a
-  ;;  client thread's managing custodian shuts down)
-  (define pool-cust (make-custodian))
-  ;; using async-channel here as a concurrent queue
-  (define idle-return-chan (make-async-channel max-idle))
-  ;; key (ie thread) \in hashtable == connection is leased out
-  ;; NOTE: The hash table determines who has the connection.
-  ;;       The "owner" field in a connection struct is just a secondary check
-  (define key=>conn (make-hasheq))
-  ;; pubsubs: [HashEqof redis-connection => Custodian]
-  (define pubsubs (make-hasheq))
-  (define fresh-conn-sema (make-semaphore max-conn))
-  (define (release-conn thd.conn dead?)
-    (match-define (cons thd conn) thd.conn)
-    (let ([maybe-cust (hash-ref pubsubs conn #f)])
-      (when maybe-cust
-        (custodian-shutdown-all maybe-cust)))
-    (hash-remove! pubsubs conn)
-    (hash-remove! key=>conn thd)
-    (set-redis-connection-pubsub! conn #f)
-    (set-redis-connection-owner! conn #f)
-    ;; prevent exceptions from killing manager or client thread
-    ;; abandon the connection if an exception is raised
-    (with-handlers
-        ([exn? (lambda(e)
-                 ((error-display-handler) (exn-message e) e)
-                 (unless dead?
-                   (semaphore-post fresh-conn-sema)))])
-      (cond ; if pool is dead, disconnect from db, or cleanup and return to pool
-        [dead? (disconnect conn)]
-        [else
-          ;; Reset state of returned connection.
-          ;; Subscribe to a fake channel so that we can synchronize unsubscribing
-          ;;  regardless of the commands queued on this connection
-          (send-cmd/no-reply #:rconn conn "SUBSCRIBE" "clean-me-up")
-          (send-cmd/no-reply #:rconn conn "PUNSUBSCRIBE")
-          (send-cmd/no-reply #:rconn conn "UNSUBSCRIBE")
-          (let loop ()
-            (let ([reply (get-reply conn)])
-              (unless (and (list? reply)
-                           (= (length reply) 3)
-                           (bytes=? (car reply) #"subscribe")
-                           (bytes=? (cadr reply) #"clean-me-up"))
-                (loop))))
-          (let loop ()
-            (let ([reply (get-reply conn)])
-              (unless (and (list? reply)
-                           (= (length reply) 3)
-                           (or (bytes=? (car reply) #"unsubscribe")
-                               (bytes=? (car reply) #"punsubscribe"))
-                           (= (caddr reply) 0))
-                (loop))))
-          (send-cmd #:rconn conn "UNWATCH")
-          (unless (sync/timeout 0 (async-channel-put-evt idle-return-chan conn))
-            (disconnect conn)
-            (semaphore-post fresh-conn-sema))])))
-  (define pool-thread (thread (lambda ()
-    (let loop ()
-      (sync
-        ;; release connection if owner thread dies
-        (handle-evt
-          (apply choice-evt
-            (map 
-             (lambda (thd.conn) 
-               (wrap-evt (thread-dead-evt (car thd.conn)) (lambda _ thd.conn)))
-             ;; XXX not sure what will happen if key=>conn is modified 
-             ;; concurrently here; docs say:
-             ;;   "Changes by one thread to a hash table can affect the keys 
-             ;;    and values seen by another thread part-way through its 
-             ;;    traversal"
-             (hash->list key=>conn)))
-          (lambda (thd.conn)
-            (when (redis-connection-owner (cdr thd.conn))
-              (release-conn thd.conn (redis-connection-pool-dead? pool)))
-            (loop)))
-        ;; handle thread msgs
-        (handle-evt
-          (thread-receive-evt)
-          (lambda _
-            (match (thread-receive)
-             ['die
-              (set-redis-connection-pool-dead?! pool #t)
-              (let dis-loop ()
-                (let ([maybe-idle-conn 
-                       (async-channel-try-get idle-return-chan)])
-                  (when maybe-idle-conn
-                    (disconnect maybe-idle-conn)
-                    (dis-loop))))
-              (loop)]
-             ['new (loop)]
-             [thd.conn
-              (release-conn thd.conn (redis-connection-pool-dead? pool))
-              (loop)]))))))))
-  (define pool
-    (redis-connection-pool
-      host port #f key=>conn pubsubs
-      idle-return-chan fresh-conn-sema pool-thread pool-cust))
-  pool)
-
-(define (kill-connection-pool pool)
-  (thread-send (redis-connection-pool-manager-thread pool) 'die))
-
-;; gets an idle connection from the pool, or else makes a new connection
-(define (get-idle-or-new-conn pool)
-  ;; try to get an idle conn
-  (or (async-channel-try-get (redis-connection-pool-idle-conns pool))
-      ;; if no conns avail:
-      ;; - either connection becomes available in the queue,
-      ;; - or create a new connection
-      ;; a 0 timeout doesnt allow enough cleanup time so new connections will
-      ;; be created unnecessarily, and the stress test will hit max connections
-      (sync/timeout .5
-        (redis-connection-pool-idle-conns pool)
-        (wrap-evt (redis-connection-pool-fresh-conn-sema pool)
-          (lambda _
-            (parameterize
-               ([current-custodian (redis-connection-pool-custodian pool)])
-              (connect (redis-connection-pool-host pool)
-                       (redis-connection-pool-port pool))))))
-      (redis-error "Maximum connections reached.")))
-
-(define (connection-pool-lease [pool (current-redis-pool)])
-  (unless pool (redis-error "pool-lease: no pool given"))
-  (when (redis-connection-pool-dead? pool)
-    (redis-error "Attempted to lease connection from dead connection pool."))
-  (or
-   ;; if cur-thread already has a connection, return the same connection
-   ;; ie, 1 connection per thread
-   (hash-ref (redis-connection-pool-key=>conn pool) (current-thread) #f)
-   ;; else get from avail connections
-   (let ([conn (get-idle-or-new-conn pool)])
-     (hash-set! (redis-connection-pool-key=>conn pool) (current-thread) conn)
-     (set-redis-connection-owner! conn (current-thread))
-     (thread-send (redis-connection-pool-manager-thread pool) 'new)
-     conn)))
-
-(define (connection-pool-return conn [pool (current-redis-pool)])
-  (unless pool (redis-error "pool-return: no pool given"))
-  (check-owner-ok conn "RETURN")
-  ;; this check prevents double returns by the same thread;
-  ;; shouldn't get race condition between two different threads since they
-  ;; cant own/return the same connection
-  (when (hash-has-key? (redis-connection-pool-key=>conn pool) (current-thread))
-    (hash-remove! (redis-connection-pool-key=>conn pool) (current-thread))
-    (set-redis-connection-owner! conn #f)
-    (thread-send (redis-connection-pool-manager-thread pool)
-                 (cons (current-thread) conn))))
+  (match-define (redis-connection in out _ _ closed?) conn)
+  (void
+    (unless closed?
+      (dynamic-wind
+        void
+        (lambda _ (send-cmd/no-reply #:rconn conn "QUIT"))
+        (lambda _
+          (close-input-port in)
+          (close-output-port out)
+          (set-redis-connection-closed?! conn #t))))))
 
 ;; pubsub-specific connections ------------------------------------------------
 ;; A pubsub connection spins up a thread to handle subscribe/unsubscribe msgs
 ;;  and distribute other messages to the appropriate channels
 ;; This thread is managed by a dedicated custodian
 
-(define (pubsub-connection? conn) (and (redis-connection-pubsub conn) #t))
+(define (pubsub-connection? conn) (and (redis-connection? conn) (redis-connection-pubsub conn) #t))
 
-(define (lease-pubsub-conn [pool (current-redis-pool)])
-  (unless pool (redis-error "pool-lease-pubsub: no pool given"))
-  (when (redis-connection-pool-dead? pool)
-    (redis-error "Attempted to lease connection from dead connection pool."))
-  (define conn (get-idle-or-new-conn pool))
-  (define cust (make-custodian))
+(define (pubsub-connect [host LOCALHOST] [port DEFAULT-REDIS-PORT])
+  (define conn (connect host port))
   (define subscribers (make-hash)) ;; key -> list of subscribed channels
-  (define pubsub-th ; thread to check for sub/unsub confirmations
-    (parameterize ([current-custodian cust])
-      (thread (λ ()
-        (define in (redis-connection-in conn))
-        (let loop ()
-          (define reply (get-reply/port in))
-          (unless (eof-object? reply)
+  (define pubsub-th ; thread to check for sub/unsub confirmations and distribute messages
+    (thread (λ ()
+      (define in (redis-connection-in conn))
+      (let loop ()
+        (define reply (get-reply/port in))
+        (unless (eof-object? reply)
           (cond
-           [(bytes=? (car reply) #"subscribe")
-            (printf "SUBSCRIBE (#~a) ~a confirmed.\n" 
-              (caddr reply) (cadr reply))]
-           [(bytes=? (car reply) #"psubscribe")
-            (printf "PSUBSCRIBE (#~a) ~a confirmed.\n" 
-              (caddr reply) (cadr reply))]
-           [(bytes=? (car reply) #"unsubscribe")
-            (printf "UNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
-              (cadr reply) (caddr reply))]
-           [(bytes=? (car reply) #"punsubscribe")
-            (printf "PUNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
-              (cadr reply) (caddr reply))]
-           ;; subscribe message
-           [(bytes=? (car reply) #"message")
-            (let ([chans (hash-ref subscribers (cadr reply) #f)])
-              (when chans
-                (map (λ (c) (async-channel-put c (caddr reply))) chans)))]
-           ;; psubscribe message
-           [(bytes=? (car reply) #"pmessage")
-            (let ([chans (hash-ref subscribers (cadr reply) #f)])
-              (when chans
-                (map (λ (c) (async-channel-put c (cddr reply))) chans)))])
-          (loop)))))))
+            [(bytes=? (car reply) #"subscribe")
+             (printf "SUBSCRIBE (#~a) ~a confirmed.\n" 
+                     (caddr reply) (cadr reply))]
+            [(bytes=? (car reply) #"psubscribe")
+             (printf "PSUBSCRIBE (#~a) ~a confirmed.\n" 
+                     (caddr reply) (cadr reply))]
+            [(bytes=? (car reply) #"unsubscribe")
+             (printf "UNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
+                     (cadr reply) (caddr reply))]
+            [(bytes=? (car reply) #"punsubscribe")
+             (printf "PUNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
+                     (cadr reply) (caddr reply))]
+            ;; subscribe message
+            [(bytes=? (car reply) #"message")
+             (let ([chans (hash-ref subscribers (cadr reply) #f)])
+               (when chans
+                 (map (λ (c) (async-channel-put c (caddr reply))) chans)))]
+            ;; psubscribe message
+            [(bytes=? (car reply) #"pmessage")
+             (let ([chans (hash-ref subscribers (cadr reply) #f)])
+               (when chans
+                 (map (λ (c) (async-channel-put c (cddr reply))) chans)))])
+          (loop))))))
   (set-redis-connection-pubsub! conn subscribers)
-  (hash-set! (redis-connection-pool-pubsubs pool) conn cust)
-  ;; should owner be #f so connection can be shared between threads?
-  (set-redis-connection-owner! conn (current-thread))
-  (thread-send (redis-connection-pool-manager-thread pool) 'new)
   conn)
 
 ;; make-subscribe-chan : 
 ;; - (p)subscribes to a key on a pubsub connection
 ;; - returns an async-channel that listens for that key's messages
 (define (make-subscribe-chan conn key
-                             [pool (current-redis-pool)]
                              #:psubscribe [psub? #f])
-  (unless pool (redis-error "pool-make-subscribe-chan: no pool given"))
-  (match-define (redis-connection in _ _ pubsub) conn)
+  (match-define (redis-connection in _ _ pubsub _) conn)
   (unless pubsub (redis-error "Tried to SUBSCRIBE on non pubsub connection."))
   (send-cmd/no-reply #:rconn conn (if psub? 'psubscribe 'subscribe) key)
-  (define ch (make-async-channel)) ; custodians don't affect async chans
-  (define pubsubs (redis-connection-pool-pubsubs pool))
-  (unless (hash-has-key? pubsubs conn)
-    (redis-error
-        "make-subscribe-chan: Not given a known pubsub connection."))
+  (define ch (make-async-channel))
   (define bytes-key (or (and (string? key) (string->bytes/utf-8 key))
                         (and (symbol? key) (string->bytes/utf-8 (symbol->string key)))
                         key))
   (hash-update! pubsub bytes-key (λ (v) (cons ch v)) null)
   ch)
 
-;; returns a pubsub connection to the pool
-(define (return-pubsub-conn conn [pool (current-redis-pool)])
-  (unless pool (redis-error "pool-return-pubsub: no pool given"))
-  (check-owner-ok conn "UNSUBSCRIBE")
-  (unless (pubsub-connection? conn)
-    (redis-error "Tried to unsubscribe from a non-pubsub connection."))
-  (define pubsubs (redis-connection-pool-pubsubs pool))
-  ;; this check prevents double close
-  (when (hash-has-key? pubsubs conn)
-    ;; kill the threads monitoring this connection
-    (custodian-shutdown-all (hash-ref pubsubs conn))
-    (hash-remove! (redis-connection-pool-pubsubs pool) conn)
-    (set-redis-connection-owner! conn #f)
-    (set-redis-connection-pubsub! conn #f)
-    (thread-send (redis-connection-pool-manager-thread pool)
-                 (cons (current-thread) conn))))
-
-
 ;; send cmd/recv reply --------------------------------------------------------
 
 ;; send-cmd/no-reply : sends specified cmd; does not wait for reply
 ;; - Use conn if provided.
-;; - If no conn, then get it from the current pool.
-;; - If current pool not set, then create it (and set as current) and get conn.
-(define (send-cmd/no-reply #:rconn [conn #f]
+;; - If no conn, then connect and set current-redis-connection parameter
+(define (send-cmd/no-reply #:rconn [conn (current-redis-connection)]
                            #:host [host LOCALHOST]
                            #:port [port DEFAULT-REDIS-PORT] 
                            cmd . args)
   (define rconn 
-    (or conn 
-        (connection-pool-lease
-          (or (current-redis-pool) 
-              (let ([new-pool (make-connection-pool #:host host #:port port)])
-                (current-redis-pool new-pool)
-                new-pool)))))
-  (match-define (redis-connection in out owner _) rconn)
-  (check-owner-ok rconn (format "SEND-CMD (~a: ~a) on" cmd args))
+    (or (and (redis-connection? conn)
+             (eq? (current-thread) (redis-connection-owner conn))
+             conn)
+        (let ([new-conn (connect host port)])
+          (current-redis-connection new-conn)
+          new-conn)))
+  (match-define (redis-connection in out _ _ _) rconn)
   (write-bytes (mk-request cmd args) out)
   (flush-output out)
   rconn)
 
 ;; send-cmd : sends given cmd and waits for reply
-(define (send-cmd #:rconn [conn #f] 
+(define (send-cmd #:rconn [conn (current-redis-connection)]
                   #:host [host LOCALHOST]
                   #:port [port DEFAULT-REDIS-PORT] 
                   cmd . args)
@@ -393,10 +161,9 @@
 ;; get-reply : reads the reply from a redis-connection
 ;; cmd and args are used for error reporting
 ;; default in port is the connection for the current thread
-(define (get-reply [conn (connection-pool-lease (current-redis-pool))])
+(define (get-reply [conn (current-redis-connection)])
   (get-reply/port (redis-connection-in conn)))
-(define (get-reply/port [in (redis-connection-in 
-                         (connection-pool-lease (current-redis-pool)))])
+(define (get-reply/port [in (redis-connection-in (current-redis-connection))])
   (define byte1 (read-char in))
   (define reply1 (read-line in 'return-linefeed))
   (match byte1
@@ -412,11 +179,10 @@
            (if (= numreplies -1) #\null
                (for/list ([n (in-range numreplies)]) (get-reply/port in))))]))
 
-(define (get-reply-evt [conn (connection-pool-lease (current-redis-pool))])
+(define (get-reply-evt [conn (current-redis-connection)])
   (get-reply-evt/port (redis-connection-in conn)))
   
 (define (get-reply-evt/port 
-            [in (redis-connection-in 
-                  (connection-pool-lease (current-redis-pool)))])
+            [in (redis-connection-in (current-redis-connection))])
   (wrap-evt in get-reply/port))
 

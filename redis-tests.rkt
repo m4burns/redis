@@ -455,7 +455,7 @@
 
 ;; pubsub2: using pubsub-specific connections
 (test
- (define conn1 (lease-pubsub-conn))
+ (define conn1 (pubsub-connect))
  (check-true (pubsub-connection? conn1))
  (define foo-ch (make-subscribe-chan conn1 'foo))
  (define bar-ch (make-subscribe-chan conn1 'bar))
