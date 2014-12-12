@@ -72,7 +72,7 @@
             [(bytes=? (car reply) #"subscribe") (void)]
             [(bytes=? (car reply) #"psubscribe") (void)]
             [(bytes=? (car reply) #"unsubscribe") (void)]
-            [(bytes=? (car reply) #"punsubscribe")
+            [(bytes=? (car reply) #"punsubscribe") (void)]
             ;; subscribe message
             [(bytes=? (car reply) #"message")
              (let ([chans (hash-ref subscribers (cadr reply) #f)])
