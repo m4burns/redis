@@ -63,21 +63,16 @@
     (thread (λ ()
       (define in (redis-connection-in conn))
       (let loop ()
-        (define reply (get-reply/port in))
+        (define reply
+          (with-handlers
+            ([exn? (lambda _ eof)])
+            (get-reply/port in)))
         (unless (eof-object? reply)
           (cond
-            [(bytes=? (car reply) #"subscribe")
-             (printf "SUBSCRIBE (#~a) ~a confirmed.\n" 
-                     (caddr reply) (cadr reply))]
-            [(bytes=? (car reply) #"psubscribe")
-             (printf "PSUBSCRIBE (#~a) ~a confirmed.\n" 
-                     (caddr reply) (cadr reply))]
-            [(bytes=? (car reply) #"unsubscribe")
-             (printf "UNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
-                     (cadr reply) (caddr reply))]
+            [(bytes=? (car reply) #"subscribe") (void)]
+            [(bytes=? (car reply) #"psubscribe") (void)]
+            [(bytes=? (car reply) #"unsubscribe") (void)]
             [(bytes=? (car reply) #"punsubscribe")
-             (printf "PUNSUBSCRIBE ~a confirmed, ~a subscriptions remaining.\n" 
-                     (cadr reply) (caddr reply))]
             ;; subscribe message
             [(bytes=? (car reply) #"message")
              (let ([chans (hash-ref subscribers (cadr reply) #f)])
